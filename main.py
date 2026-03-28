@@ -331,7 +331,7 @@ def analyse_with_claude(transcript, video_title, date_str):
         return None
 
 # ── Core watcher logic ────────────────────────────────────────────────────────
-def run_check():
+def run_check(force=False):
     """
     Main check — called once at CHECK_TIME_ET each weekday.
     1. Fetch RSS feed (free)
@@ -352,21 +352,36 @@ def run_check():
         tg_send("⚠️ RossWatcher: Could not fetch YouTube RSS feed.")
         return
 
-    # Find today's unprocessed recap videos
-    new_recaps = [
-        v for v in videos
-        if published_today(v)
-        and is_recap_video(v)
-        and v["video_id"] not in state["processed_ids"]
-    ]
-
-    log.info(f"Found {len(new_recaps)} new recap(s) today")
+    # Find recap videos — force mode: any recent recap, ignore today/processed filters
+    if force:
+        new_recaps = [
+            v for v in videos
+            if is_recap_video(v)
+        ]
+        # In force mode, take the most recent one we haven't processed
+        # Try unprocessed first, fall back to most recent overall
+        unprocessed = [v for v in new_recaps if v["video_id"] not in state["processed_ids"]]
+        new_recaps  = unprocessed if unprocessed else new_recaps[:1]
+        log.info(f"Force mode: {len(new_recaps)} recap(s) found (ignoring date/processed filters)")
+        if new_recaps:
+            tg_send(f"🔍 Force mode — analysing: _{new_recaps[0]['title']}_")
+    else:
+        new_recaps = [
+            v for v in videos
+            if published_today(v)
+            and is_recap_video(v)
+            and v["video_id"] not in state["processed_ids"]
+        ]
+        log.info(f"Found {len(new_recaps)} new recap(s) today")
 
     if not new_recaps:
-        tg_send(
-            f"📭 *RossWatcher* — No new recap video found yet for {date_str}.\n"
-            f"_Ross may not have posted today, or check back later._"
-        )
+        if force:
+            tg_send("📭 *RossWatcher* — No recap videos found in RSS feed at all.")
+        else:
+            tg_send(
+                f"📭 *RossWatcher* — No new recap video found yet for {date_str}.\n"
+                f"_Ross may not have posted today. Try /rw check on a weekday after 3 PM ET._"
+            )
         return
 
     for video in new_recaps:
@@ -496,36 +511,40 @@ def poll_telegram_commands():
         if cid != str(TG_CHAT):
             continue  # ignore messages from other chats
 
-        if text == "/check":
-            tg_send("🔄 *RossWatcher* — Manual check triggered...")
+        # RossWatcher uses /rw prefix to avoid conflicts with GreenClaw
+        # Commands: /rw check | /rw status | /rw help
+        if text in ("/rw check", "/rw check@greenhebitradingbot"):
+            tg_send("🔄 *RossWatcher* — Manual check triggered (bypassing weekday/date filters)...")
             try:
-                run_check()
+                run_check(force=True)
             except Exception as e:
                 tg_send(f"⚠️ Error: {e}")
 
-        elif text == "/status":
+        elif text in ("/rw status", "/rw status@greenhebitradingbot"):
             state   = load_state()
             now_et  = datetime.now(ET_TZ)
             is_wd   = now_et.weekday() < 5
             ch, cm  = parse_check_time()
             tg_send(
-                f"🔍 *RossWatcher Status*\n"
+                f"👁 *RossWatcher Status*\n"
                 f"Time (ET): {now_et.strftime('%H:%M')}\n"
                 f"Daily check: {ch:02d}:{cm:02d} ET (weekdays)\n"
-                f"Today is a: {'weekday' if is_wd else 'weekend'}\n"
+                f"Today is a: {'weekday ✅' if is_wd else 'weekend ⏸'}\n"
                 f"Last check: {state.get('last_check', 'never')}\n"
                 f"Videos processed: {len(state.get('processed_ids', []))}\n"
                 f"Transcript API: {'✅' if TRANSCRIPT_KEY else '❌ not set'}\n"
                 f"Anthropic API: {'✅' if ANTHROPIC_KEY else '❌ not set'}\n"
-                f"Sheets webhook: {'✅' if SHEETS_URL else '❌ not set'}"
+                f"Sheets webhook: {'✅' if SHEETS_URL else '❌ not set'}\n"
+                f"\n_Commands: /rw check | /rw status | /rw help_"
             )
 
-        elif text == "/help":
+        elif text in ("/rw help", "/rw help@greenhebitradingbot"):
             tg_send(
-                "*RossWatcher Commands*\n"
-                "/check — trigger today's check now\n"
-                "/status — show current config and state\n"
-                "/help — this message"
+                "👁 *RossWatcher Commands*\n"
+                "_(prefix /rw to avoid conflicts with GreenClaw)_\n\n"
+                "/rw check  — fetch & analyse today's recap now\n"
+                "/rw status — show config, last check, counts\n"
+                "/rw help   — this message"
             )
 
 # ── Health check HTTP server ──────────────────────────────────────────────────
@@ -614,10 +633,10 @@ def main():
         f"👁 *RossWatcher v1 Started*\n"
         f"Channel: {CHANNEL_HANDLE}\n"
         f"Daily check: {ch:02d}:{cm:02d} ET (weekdays)\n"
-        f"Transcript API: ✅\n"
-        f"Claude analysis: ✅\n"
+        f"Transcript API: {'✅' if TRANSCRIPT_KEY else '❌'}\n"
+        f"Claude analysis: {'✅' if ANTHROPIC_KEY else '❌'}\n"
         f"Sheets push: {'✅' if SHEETS_URL else '⚠️ disabled'}\n"
-        f"Commands: /check /status /help"
+        f"Commands: /rw check | /rw status | /rw help"
     )
 
     # Start main scheduler loop

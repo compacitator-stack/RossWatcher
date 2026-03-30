@@ -40,7 +40,7 @@ TG_CHAT         = os.environ.get("TELEGRAM_CHAT_ID", "")
 TRANSCRIPT_KEY  = os.environ.get("TRANSCRIPT_API_KEY", "")
 ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 SHEETS_URL      = os.environ.get("SHEETS_WEBHOOK_URL", "")
-CHECK_TIME_ET   = os.environ.get("CHECK_TIME_ET", "17:00")
+CHECK_TIME_ET   = os.environ.get("CHECK_TIME_ET", "17:30")  # 5:30 PM — gives captions ~90min to generate
 PORT            = int(os.environ.get("PORT", "8081"))
 
 # Ross's confirmed channel details
@@ -217,10 +217,13 @@ def published_today(video):
     return pub_et.date() == now_et.date()
 
 # ── Transcript fetch ──────────────────────────────────────────────────────────
-def fetch_transcript(video_id):
+def fetch_transcript(video_id, max_retries=3, retry_delay=600):
     """
     Fetch transcript via TranscriptAPI.com REST endpoint.
-    Costs 1 credit per video.
+    Costs 1 credit per successful fetch.
+    Retries up to max_retries times on 403 errors (video too new —
+    YouTube blocks transcript access until captions are processed,
+    typically within 10-30 min of upload).
     """
     if not TRANSCRIPT_KEY:
         log.error("TRANSCRIPT_API_KEY not set")
@@ -228,26 +231,45 @@ def fetch_transcript(video_id):
 
     url = (f"https://transcriptapi.com/api/v2/youtube/transcript"
            f"?video_url={video_id}&format=text&include_timestamp=false")
-    try:
-        req = urllib.request.Request(url, headers={
-            "Authorization": f"Bearer {TRANSCRIPT_KEY}"
-        })
-        with urllib.request.urlopen(req, timeout=60, context=_ssl) as resp:
-            data = json.loads(resp.read())
 
-        # API returns {"content": "# Metadata\n...\n# Transcript\n..."}
-        content = data.get("content", "")
-        if "# Transcript" in content:
-            transcript = content.split("# Transcript", 1)[1].strip()
-        else:
-            transcript = content
+    for attempt in range(1, max_retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={
+                "Authorization": f"Bearer {TRANSCRIPT_KEY}"
+            })
+            with urllib.request.urlopen(req, timeout=60, context=_ssl) as resp:
+                data = json.loads(resp.read())
 
-        log.info(f"Transcript fetched: {len(transcript)} chars")
-        return transcript
+            # API returns {"content": "# Metadata\n...\n# Transcript\n..."}
+            content = data.get("content", "")
+            if "# Transcript" in content:
+                transcript = content.split("# Transcript", 1)[1].strip()
+            else:
+                transcript = content
 
-    except Exception as e:
-        log.error(f"Transcript fetch failed for {video_id}: {e}")
-        return None
+            log.info(f"Transcript fetched: {len(transcript)} chars")
+            return transcript
+
+        except urllib.error.HTTPError as e:
+            if e.code == 403 and attempt < max_retries:
+                wait_min = retry_delay // 60
+                log.warning(
+                    f"Transcript 403 for {video_id} (video too new) — "
+                    f"attempt {attempt}/{max_retries}, retrying in {wait_min} min")
+                tg_send(
+                    f"⏳ *RossWatcher* — transcript not ready yet for today's video\n"
+                    f"YouTube is still processing captions. "
+                    f"Retrying in {wait_min} min (attempt {attempt}/{max_retries})")
+                time.sleep(retry_delay)
+            else:
+                log.error(f"Transcript fetch failed for {video_id}: {e}")
+                return None
+        except Exception as e:
+            log.error(f"Transcript fetch failed for {video_id}: {e}")
+            return None
+
+    log.error(f"Transcript fetch gave up after {max_retries} attempts for {video_id}")
+    return None
 
 # ── Claude analysis ───────────────────────────────────────────────────────────
 ANALYSIS_PROMPT = """You are analysing a Ross Cameron (Warrior Trading) daily trading recap video transcript.
@@ -469,11 +491,14 @@ def scheduler_loop():
                 and now_et.minute == check_minute
                 and last_triggered_date != today):
             last_triggered_date = today
-            try:
-                run_check()
-            except Exception as e:
-                log.error(f"run_check error: {e}")
-                tg_send(f"⚠️ RossWatcher error: {e}")
+            # Run in background thread so Telegram polling stays responsive
+            def _run():
+                try:
+                    run_check()
+                except Exception as e:
+                    log.error(f"run_check error: {e}")
+                    tg_send(f"⚠️ RossWatcher error: {e}")
+            threading.Thread(target=_run, daemon=True).start()
 
         # Poll Telegram for /check command (manual trigger)
         try:
@@ -515,10 +540,13 @@ def poll_telegram_commands():
         # Commands: /rw check | /rw status | /rw help
         if text in ("/rw check", "/rw check@greenhebitradingbot"):
             tg_send("🔄 *RossWatcher* — Manual check triggered (bypassing weekday/date filters)...")
-            try:
-                run_check(force=True)
-            except Exception as e:
-                tg_send(f"⚠️ Error: {e}")
+            # Background thread keeps polling responsive during long API calls
+            def _force_run():
+                try:
+                    run_check(force=True)
+                except Exception as e:
+                    tg_send(f"⚠️ Error: {e}")
+            threading.Thread(target=_force_run, daemon=True).start()
 
         elif text in ("/rw status", "/rw status@greenhebitradingbot"):
             state   = load_state()

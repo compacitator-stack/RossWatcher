@@ -90,30 +90,38 @@ def save_state(state):
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def tg_send(text):
-    """Send a Telegram message, splitting if over 4000 chars."""
+    """Send a Telegram message, splitting if over 4000 chars.
+    Tries Markdown parse mode first; falls back to plain text on 400 errors.
+    """
     if not TG_TOKEN or not TG_CHAT:
-        log.warning("Telegram not configured — skipping send")
+        log.warning("Telegram not configured \u2014 skipping send")
         return
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
     for chunk in chunks:
-        try:
-            payload = json.dumps({
-                "chat_id": TG_CHAT,
-                "text": chunk,
-                "parse_mode": "Markdown"
-            }).encode()
-            req = urllib.request.Request(
-                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            urllib.request.urlopen(req, timeout=15, context=_ssl)
-        except Exception as e:
-            log.error(f"Telegram send failed: {e}")
-        time.sleep(0.5)
-
-# ── Sheets push ───────────────────────────────────────────────────────────────
+        for parse_mode in ("Markdown", None):
+            try:
+                msg = {"chat_id": TG_CHAT, "text": chunk}
+                if parse_mode:
+                    msg["parse_mode"] = parse_mode
+                payload = json.dumps(msg).encode()
+                req = urllib.request.Request(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST"
+                )
+                urllib.request.urlopen(req, timeout=15, context=_ssl)
+                break  # success
+            except urllib.error.HTTPError as e:
+                if e.code == 400 and parse_mode:
+                    log.warning("Telegram Markdown parse failed, retrying as plain text")
+                    continue
+                log.error(f"Telegram send failed: {e}")
+                break
+            except Exception as e:
+                log.error(f"Telegram send failed: {e}")
+                break
+        time.sleep(0.3)
 def sheets_push(payload):
     """Push data to Google Sheets webhook — non-fatal on failure."""
     if not SHEETS_URL:
@@ -325,7 +333,7 @@ def analyse_with_claude(transcript, video_title, date_str):
 
     try:
         payload = json.dumps({
-            "model":      "claude-sonnet-4-20250514",
+            "model":      "claude-3-5-sonnet-20241022",
             "max_tokens": 1500,
             "messages": [{"role": "user", "content": prompt}]
         }).encode()
@@ -538,7 +546,7 @@ def poll_telegram_commands():
 
         # RossWatcher uses /rw prefix to avoid conflicts with GreenClaw
         # Commands: /rw check | /rw status | /rw help
-        if text in ("/rw check", "/rw check@greenhebitradingbot"):
+        if text in ("/rw check", "/rw check@zeaburgreenbot"):
             tg_send("🔄 *RossWatcher* — Manual check triggered (bypassing weekday/date filters)...")
             # Background thread keeps polling responsive during long API calls
             def _force_run():
@@ -548,7 +556,7 @@ def poll_telegram_commands():
                     tg_send(f"⚠️ Error: {e}")
             threading.Thread(target=_force_run, daemon=True).start()
 
-        elif text in ("/rw status", "/rw status@greenhebitradingbot"):
+        elif text in ("/rw status", "/rw status@zeaburgreenbot"):
             state   = load_state()
             now_et  = datetime.now(ET_TZ)
             is_wd   = now_et.weekday() < 5
@@ -566,7 +574,7 @@ def poll_telegram_commands():
                 f"\n_Commands: /rw check | /rw status | /rw help_"
             )
 
-        elif text in ("/rw help", "/rw help@greenhebitradingbot"):
+        elif text in ("/rw help", "/rw help@zeaburgreenbot"):
             tg_send(
                 "👁 *RossWatcher Commands*\n"
                 "_(prefix /rw to avoid conflicts with GreenClaw)_\n\n"

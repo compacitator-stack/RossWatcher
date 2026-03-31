@@ -27,13 +27,15 @@ import time
 import signal
 import logging
 import threading
-import subprocess
 import urllib.request
 import urllib.error
 import ssl
 from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from xml.etree import ElementTree
+
+# curl_cffi impersonates Chrome's TLS fingerprint — bypasses Cloudflare BIC (error 1010)
+from curl_cffi import requests as cffi_requests
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TG_TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -235,63 +237,16 @@ DEFERRED_RETRY_DELAY = 3600  # 1 hour
 # HTTP codes that indicate "transcript not available yet" — retry these
 RETRYABLE_HTTP_CODES = {403, 422, 500, 502, 503, 504}
 
-def _curl_fetch(url, api_key):
-    """
-    Fetch a URL using curl subprocess instead of urllib.
-    curl has a different TLS fingerprint than Python's urllib/ssl,
-    which bypasses Cloudflare's Browser Integrity Check (error 1010).
-    Returns (http_code, body_text) tuple.
-    """
-    try:
-        result = subprocess.run(
-            [
-                "curl", "-s",               # silent (no progress)
-                "-w", "\n%{http_code}",      # append HTTP code after body
-                "-H", f"Authorization: Bearer {api_key}",
-                "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/124.0.0.0 Safari/537.36",
-                "-H", "Accept: application/json, text/plain, */*",
-                "--max-time", "60",
-                url,
-            ],
-            capture_output=True, text=True, timeout=90,
-        )
-        # Last line is the HTTP status code (from -w)
-        lines = result.stdout.rsplit("\n", 1)
-        if len(lines) == 2:
-            body = lines[0]
-            try:
-                http_code = int(lines[1].strip())
-            except ValueError:
-                http_code = 0
-        else:
-            body = result.stdout
-            http_code = 0
-
-        if result.returncode != 0 and http_code == 0:
-            # curl itself failed (DNS, connection refused, etc.)
-            err = result.stderr.strip() or f"curl exit code {result.returncode}"
-            return (0, f"curl error: {err}")
-
-        return (http_code, body)
-
-    except FileNotFoundError:
-        return (0, "curl not found — install curl in the container")
-    except subprocess.TimeoutExpired:
-        return (0, "curl timed out after 90s")
-    except Exception as e:
-        return (0, f"curl subprocess error: {type(e).__name__}: {e}")
-
-
 def fetch_transcript(video_id, max_retries=6, backoff_schedule=None):
     """
-    Fetch transcript via TranscriptAPI.com REST endpoint using curl.
+    Fetch transcript via TranscriptAPI.com REST endpoint using curl_cffi.
     Costs 1 credit per successful fetch.
 
-    Uses curl instead of urllib to bypass Cloudflare's TLS fingerprinting
-    (error 1010). Retries on retryable HTTP errors (403, 422, 5xx) AND
-    network-level failures.
+    Uses curl_cffi with Chrome TLS impersonation to bypass Cloudflare's
+    Browser Integrity Check (error 1010). Python's urllib/requests use
+    a detectable TLS fingerprint that Cloudflare blocks.
+
+    Retries on retryable HTTP errors (403, 422, 5xx) AND network failures.
     Uses escalating backoff: 10→15→20→25→30→30 min (~130 min total window).
     """
     if not TRANSCRIPT_KEY:
@@ -305,7 +260,23 @@ def fetch_transcript(video_id, max_retries=6, backoff_schedule=None):
            f"?video_url={video_id}&format=text&include_timestamp=false")
 
     for attempt in range(1, max_retries + 1):
-        http_code, body = _curl_fetch(url, TRANSCRIPT_KEY)
+        http_code = 0
+        body = ""
+
+        try:
+            resp = cffi_requests.get(
+                url,
+                headers={"Authorization": f"Bearer {TRANSCRIPT_KEY}"},
+                impersonate="chrome",
+                timeout=60,
+            )
+            http_code = resp.status_code
+            body = resp.text
+
+        except Exception as e:
+            # Network-level failures (DNS, connection refused, TLS errors, timeout)
+            body = f"curl_cffi error: {type(e).__name__}: {e}"
+            log.warning(f"Transcript network error for {video_id}: {body}")
 
         # ── Success ──
         if http_code == 200:
@@ -325,7 +296,7 @@ def fetch_transcript(video_id, max_retries=6, backoff_schedule=None):
             log.info(f"Transcript fetched: {len(transcript)} chars")
             return transcript
 
-        # ── Retryable error ──
+        # ── Error handling ──
         is_retryable = http_code in RETRYABLE_HTTP_CODES or http_code == 0
         body_snippet = body[:300] if body else "(empty)"
 

@@ -27,6 +27,7 @@ import time
 import signal
 import logging
 import threading
+import subprocess
 import urllib.request
 import urllib.error
 import ssl
@@ -234,13 +235,63 @@ DEFERRED_RETRY_DELAY = 3600  # 1 hour
 # HTTP codes that indicate "transcript not available yet" — retry these
 RETRYABLE_HTTP_CODES = {403, 422, 500, 502, 503, 504}
 
+def _curl_fetch(url, api_key):
+    """
+    Fetch a URL using curl subprocess instead of urllib.
+    curl has a different TLS fingerprint than Python's urllib/ssl,
+    which bypasses Cloudflare's Browser Integrity Check (error 1010).
+    Returns (http_code, body_text) tuple.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "curl", "-s",               # silent (no progress)
+                "-w", "\n%{http_code}",      # append HTTP code after body
+                "-H", f"Authorization: Bearer {api_key}",
+                "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0.0.0 Safari/537.36",
+                "-H", "Accept: application/json, text/plain, */*",
+                "--max-time", "60",
+                url,
+            ],
+            capture_output=True, text=True, timeout=90,
+        )
+        # Last line is the HTTP status code (from -w)
+        lines = result.stdout.rsplit("\n", 1)
+        if len(lines) == 2:
+            body = lines[0]
+            try:
+                http_code = int(lines[1].strip())
+            except ValueError:
+                http_code = 0
+        else:
+            body = result.stdout
+            http_code = 0
+
+        if result.returncode != 0 and http_code == 0:
+            # curl itself failed (DNS, connection refused, etc.)
+            err = result.stderr.strip() or f"curl exit code {result.returncode}"
+            return (0, f"curl error: {err}")
+
+        return (http_code, body)
+
+    except FileNotFoundError:
+        return (0, "curl not found — install curl in the container")
+    except subprocess.TimeoutExpired:
+        return (0, "curl timed out after 90s")
+    except Exception as e:
+        return (0, f"curl subprocess error: {type(e).__name__}: {e}")
+
+
 def fetch_transcript(video_id, max_retries=6, backoff_schedule=None):
     """
-    Fetch transcript via TranscriptAPI.com REST endpoint.
+    Fetch transcript via TranscriptAPI.com REST endpoint using curl.
     Costs 1 credit per successful fetch.
 
-    Retries on retryable HTTP errors (403, 422, 5xx) AND network-level
-    failures (URLError, timeout, connection reset).
+    Uses curl instead of urllib to bypass Cloudflare's TLS fingerprinting
+    (error 1010). Retries on retryable HTTP errors (403, 422, 5xx) AND
+    network-level failures.
     Uses escalating backoff: 10→15→20→25→30→30 min (~130 min total window).
     """
     if not TRANSCRIPT_KEY:
@@ -253,23 +304,18 @@ def fetch_transcript(video_id, max_retries=6, backoff_schedule=None):
     url = (f"https://transcriptapi.com/api/v2/youtube/transcript"
            f"?video_url={video_id}&format=text&include_timestamp=false")
 
-    # Headers that pass Cloudflare Browser Integrity Check (BIC).
-    # Without a realistic User-Agent + Accept, Cloudflare returns 403 / error 1010.
-    api_headers = {
-        "Authorization":  f"Bearer {TRANSCRIPT_KEY}",
-        "User-Agent":     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept":         "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
     for attempt in range(1, max_retries + 1):
-        try:
-            req = urllib.request.Request(url, headers=api_headers)
-            with urllib.request.urlopen(req, timeout=60, context=_ssl) as resp:
-                data = json.loads(resp.read())
+        http_code, body = _curl_fetch(url, TRANSCRIPT_KEY)
 
-            # API returns {"content": "# Metadata\n...\n# Transcript\n..."}
+        # ── Success ──
+        if http_code == 200:
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as e:
+                log.error(f"Transcript JSON parse failed for {video_id}: {e}\n  Body[:200]: {body[:200]}")
+                tg_send(f"❌ Transcript JSON parse error: {str(e)[:200]}")
+                return None
+
             content = data.get("content", "")
             if "# Transcript" in content:
                 transcript = content.split("# Transcript", 1)[1].strip()
@@ -279,62 +325,31 @@ def fetch_transcript(video_id, max_retries=6, backoff_schedule=None):
             log.info(f"Transcript fetched: {len(transcript)} chars")
             return transcript
 
-        except urllib.error.HTTPError as e:
-            # Read the response body for diagnostics
-            err_body = ""
-            try:
-                err_body = e.read().decode("utf-8", errors="replace")[:500]
-            except Exception:
-                err_body = "(could not read error body)"
+        # ── Retryable error ──
+        is_retryable = http_code in RETRYABLE_HTTP_CODES or http_code == 0
+        body_snippet = body[:300] if body else "(empty)"
 
-            is_retryable = e.code in RETRYABLE_HTTP_CODES
-            log.warning(
-                f"Transcript HTTP {e.code} for {video_id} — "
-                f"retryable={is_retryable}, attempt {attempt}/{max_retries}\n"
-                f"  Response body: {err_body}")
+        log.warning(
+            f"Transcript fetch HTTP {http_code} for {video_id} — "
+            f"retryable={is_retryable}, attempt {attempt}/{max_retries}\n"
+            f"  Body: {body_snippet}")
 
-            if is_retryable and attempt < max_retries:
-                delay = backoff_schedule[min(attempt - 1, len(backoff_schedule) - 1)]
-                wait_min = delay // 60
-                tg_send(
-                    f"⏳ *RossWatcher* — transcript not ready yet for today's video\n"
-                    f"HTTP {e.code}: {err_body[:200]}\n"
-                    f"Retrying in {wait_min} min (attempt {attempt}/{max_retries})")
-                time.sleep(delay)
-            else:
-                reason = "non-retryable" if not is_retryable else "max retries reached"
-                log.error(
-                    f"Transcript fetch failed for {video_id}: HTTP {e.code} ({reason})\n"
-                    f"  Body: {err_body}")
-                tg_send(
-                    f"❌ Transcript fetch HTTP {e.code} ({reason})\n"
-                    f"Body: {err_body[:200]}")
-                return None
-
-        except urllib.error.URLError as e:
-            # Network-level errors (DNS, proxy 403, connection refused, timeout)
-            reason_str = str(e.reason) if hasattr(e, 'reason') else str(e)
-            log.warning(
-                f"Transcript network error for {video_id}: {reason_str} — "
-                f"attempt {attempt}/{max_retries}")
-
-            if attempt < max_retries:
-                delay = backoff_schedule[min(attempt - 1, len(backoff_schedule) - 1)]
-                wait_min = delay // 60
-                tg_send(
-                    f"⏳ *RossWatcher* — network error fetching transcript\n"
-                    f"Error: {reason_str[:200]}\n"
-                    f"Retrying in {wait_min} min (attempt {attempt}/{max_retries})")
-                time.sleep(delay)
-            else:
-                log.error(f"Transcript fetch gave up (network errors) for {video_id}: {reason_str}")
-                tg_send(f"❌ Transcript network error (gave up): {reason_str[:200]}")
-                return None
-
-        except Exception as e:
-            # Truly unexpected errors — log but don't retry (could be a bug)
-            log.error(f"Transcript fetch unexpected error for {video_id}: {type(e).__name__}: {e}")
-            tg_send(f"❌ Transcript unexpected error: {type(e).__name__}: {str(e)[:200]}")
+        if is_retryable and attempt < max_retries:
+            delay = backoff_schedule[min(attempt - 1, len(backoff_schedule) - 1)]
+            wait_min = delay // 60
+            tg_send(
+                f"⏳ *RossWatcher* — transcript not ready yet for today's video\n"
+                f"HTTP {http_code}: {body_snippet[:200]}\n"
+                f"Retrying in {wait_min} min (attempt {attempt}/{max_retries})")
+            time.sleep(delay)
+        else:
+            reason = "non-retryable" if not is_retryable else "max retries reached"
+            log.error(
+                f"Transcript fetch failed for {video_id}: HTTP {http_code} ({reason})\n"
+                f"  Body: {body_snippet}")
+            tg_send(
+                f"❌ Transcript fetch HTTP {http_code} ({reason})\n"
+                f"Body: {body_snippet[:200]}")
             return None
 
     log.error(f"Transcript fetch gave up after {max_retries} attempts for {video_id}")
@@ -520,11 +535,11 @@ def run_check(force=False):
             v for v in videos
             if is_recap_video(v)
         ]
-        # In force mode, take the most recent one we haven't processed
-        # Try unprocessed first, fall back to most recent overall
+        # In force mode, take ONLY the most recent one we haven't processed
+        # (RSS returns newest first). Fall back to most recent overall.
         unprocessed = [v for v in new_recaps if v["video_id"] not in state["processed_ids"]]
-        new_recaps  = unprocessed if unprocessed else new_recaps[:1]
-        log.info(f"Force mode: {len(new_recaps)} recap(s) found (ignoring date/processed filters)")
+        new_recaps  = unprocessed[:1] if unprocessed else new_recaps[:1]
+        log.info(f"Force mode: selected '{new_recaps[0]['title']}' (ignoring date/processed filters)" if new_recaps else "Force mode: no recaps found")
         if new_recaps:
             tg_send(f"🔍 Force mode — analysing: _{new_recaps[0]['title']}_")
     else:

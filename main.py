@@ -594,11 +594,21 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 def start_health_server():
-    """Bind health check port synchronously before main loop starts."""
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    log.info(f"Health server bound on port {PORT}")
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
+    """
+    Bind health check port synchronously so Zeabur sees it immediately.
+    Uses SO_REUSEADDR to avoid 'address already in use' on restart.
+    """
+    import socketserver
+    class ReusableTCPServer(HTTPServer):
+        allow_reuse_address = True
+    try:
+        server = ReusableTCPServer(("0.0.0.0", PORT), HealthHandler)
+        log.info(f"Health server bound on port {PORT} (Zeabur ready)")
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+    except OSError as e:
+        # Port already in use — try to continue anyway
+        log.warning(f"Health server port {PORT} bind failed: {e} — continuing")
 
 # ── Startup validation ────────────────────────────────────────────────────────
 def validate_config():
@@ -635,15 +645,18 @@ def _shutdown(sig, _):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    # ── Bind health check port IMMEDIATELY ───────────────────────────────────
+    # Zeabur probes this port within seconds of container start.
+    # Must bind before any other blocking calls (signal setup, API calls, etc.)
+    start_health_server()
+    time.sleep(0.5)  # give OS a moment to confirm port is listening
+
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT,  _shutdown)
 
     log.info("=" * 55)
     log.info("RossWatcher v1 — Ross Cameron YouTube Monitor")
     log.info("=" * 55)
-
-    # Bind health check port FIRST (Zeabur requires it)
-    start_health_server()
 
     # Validate config
     if not validate_config():

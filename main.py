@@ -41,7 +41,7 @@ TRANSCRIPT_KEY  = os.environ.get("TRANSCRIPT_API_KEY", "")
 ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 SHEETS_URL      = os.environ.get("SHEETS_WEBHOOK_URL", "")
 CHECK_TIME_ET   = os.environ.get("CHECK_TIME_ET", "17:30")  # 5:30 PM — gives captions ~90min to generate
-PORT            = int(os.environ.get("PORT", "8081"))
+PORT            = int(os.environ.get("PORT") or os.environ.get("ROSSWATCHER_PORT", "8080"))  # Zeabur injects $PORT at runtime
 
 # Ross's confirmed channel details
 CHANNEL_ID      = "UCBayuhgYpKNbhJxfExYkPfA"
@@ -581,6 +581,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         pass  # silence access logs
 
     def do_GET(self):
+        # Respond 200 on all paths — Zeabur probes / for health check
         body = json.dumps({
             "status":  "ok",
             "service": "RossWatcher",

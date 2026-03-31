@@ -253,11 +253,19 @@ def fetch_transcript(video_id, max_retries=6, backoff_schedule=None):
     url = (f"https://transcriptapi.com/api/v2/youtube/transcript"
            f"?video_url={video_id}&format=text&include_timestamp=false")
 
+    # Headers that pass Cloudflare Browser Integrity Check (BIC).
+    # Without a realistic User-Agent + Accept, Cloudflare returns 403 / error 1010.
+    api_headers = {
+        "Authorization":  f"Bearer {TRANSCRIPT_KEY}",
+        "User-Agent":     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept":         "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
     for attempt in range(1, max_retries + 1):
         try:
-            req = urllib.request.Request(url, headers={
-                "Authorization": f"Bearer {TRANSCRIPT_KEY}"
-            })
+            req = urllib.request.Request(url, headers=api_headers)
             with urllib.request.urlopen(req, timeout=60, context=_ssl) as resp:
                 data = json.loads(resp.read())
 

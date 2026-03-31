@@ -231,13 +231,16 @@ RETRY_BACKOFF_SECS = [600, 900, 1200, 1500, 1800, 1800]
 # Deferred retry delay — fires this many seconds after all retries exhausted
 DEFERRED_RETRY_DELAY = 3600  # 1 hour
 
+# HTTP codes that indicate "transcript not available yet" — retry these
+RETRYABLE_HTTP_CODES = {403, 422, 500, 502, 503, 504}
+
 def fetch_transcript(video_id, max_retries=6, backoff_schedule=None):
     """
     Fetch transcript via TranscriptAPI.com REST endpoint.
     Costs 1 credit per successful fetch.
 
-    Retries up to max_retries times on 403 errors (video too new —
-    YouTube blocks transcript access until captions are processed).
+    Retries on retryable HTTP errors (403, 422, 5xx) AND network-level
+    failures (URLError, timeout, connection reset).
     Uses escalating backoff: 10→15→20→25→30→30 min (~130 min total window).
     """
     if not TRANSCRIPT_KEY:
@@ -269,23 +272,61 @@ def fetch_transcript(video_id, max_retries=6, backoff_schedule=None):
             return transcript
 
         except urllib.error.HTTPError as e:
-            if e.code == 403 and attempt < max_retries:
-                # Pick delay from backoff schedule (clamp to last value if overrun)
+            # Read the response body for diagnostics
+            err_body = ""
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                err_body = "(could not read error body)"
+
+            is_retryable = e.code in RETRYABLE_HTTP_CODES
+            log.warning(
+                f"Transcript HTTP {e.code} for {video_id} — "
+                f"retryable={is_retryable}, attempt {attempt}/{max_retries}\n"
+                f"  Response body: {err_body}")
+
+            if is_retryable and attempt < max_retries:
                 delay = backoff_schedule[min(attempt - 1, len(backoff_schedule) - 1)]
                 wait_min = delay // 60
-                log.warning(
-                    f"Transcript 403 for {video_id} (video too new) — "
-                    f"attempt {attempt}/{max_retries}, retrying in {wait_min} min")
                 tg_send(
                     f"⏳ *RossWatcher* — transcript not ready yet for today's video\n"
-                    f"YouTube is still processing captions. "
+                    f"HTTP {e.code}: {err_body[:200]}\n"
                     f"Retrying in {wait_min} min (attempt {attempt}/{max_retries})")
                 time.sleep(delay)
             else:
-                log.error(f"Transcript fetch failed for {video_id}: HTTP {e.code}")
+                reason = "non-retryable" if not is_retryable else "max retries reached"
+                log.error(
+                    f"Transcript fetch failed for {video_id}: HTTP {e.code} ({reason})\n"
+                    f"  Body: {err_body}")
+                tg_send(
+                    f"❌ Transcript fetch HTTP {e.code} ({reason})\n"
+                    f"Body: {err_body[:200]}")
                 return None
+
+        except urllib.error.URLError as e:
+            # Network-level errors (DNS, proxy 403, connection refused, timeout)
+            reason_str = str(e.reason) if hasattr(e, 'reason') else str(e)
+            log.warning(
+                f"Transcript network error for {video_id}: {reason_str} — "
+                f"attempt {attempt}/{max_retries}")
+
+            if attempt < max_retries:
+                delay = backoff_schedule[min(attempt - 1, len(backoff_schedule) - 1)]
+                wait_min = delay // 60
+                tg_send(
+                    f"⏳ *RossWatcher* — network error fetching transcript\n"
+                    f"Error: {reason_str[:200]}\n"
+                    f"Retrying in {wait_min} min (attempt {attempt}/{max_retries})")
+                time.sleep(delay)
+            else:
+                log.error(f"Transcript fetch gave up (network errors) for {video_id}: {reason_str}")
+                tg_send(f"❌ Transcript network error (gave up): {reason_str[:200]}")
+                return None
+
         except Exception as e:
-            log.error(f"Transcript fetch failed for {video_id}: {e}")
+            # Truly unexpected errors — log but don't retry (could be a bug)
+            log.error(f"Transcript fetch unexpected error for {video_id}: {type(e).__name__}: {e}")
+            tg_send(f"❌ Transcript unexpected error: {type(e).__name__}: {str(e)[:200]}")
             return None
 
     log.error(f"Transcript fetch gave up after {max_retries} attempts for {video_id}")

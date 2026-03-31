@@ -225,17 +225,27 @@ def published_today(video):
     return pub_et.date() == now_et.date()
 
 # ── Transcript fetch ──────────────────────────────────────────────────────────
-def fetch_transcript(video_id, max_retries=3, retry_delay=600):
+# Escalating backoff schedule in seconds: 10, 15, 20, 25, 30, 30 min (~130 min window)
+RETRY_BACKOFF_SECS = [600, 900, 1200, 1500, 1800, 1800]
+
+# Deferred retry delay — fires this many seconds after all retries exhausted
+DEFERRED_RETRY_DELAY = 3600  # 1 hour
+
+def fetch_transcript(video_id, max_retries=6, backoff_schedule=None):
     """
     Fetch transcript via TranscriptAPI.com REST endpoint.
     Costs 1 credit per successful fetch.
+
     Retries up to max_retries times on 403 errors (video too new —
-    YouTube blocks transcript access until captions are processed,
-    typically within 10-30 min of upload).
+    YouTube blocks transcript access until captions are processed).
+    Uses escalating backoff: 10→15→20→25→30→30 min (~130 min total window).
     """
     if not TRANSCRIPT_KEY:
         log.error("TRANSCRIPT_API_KEY not set")
         return None
+
+    if backoff_schedule is None:
+        backoff_schedule = RETRY_BACKOFF_SECS
 
     url = (f"https://transcriptapi.com/api/v2/youtube/transcript"
            f"?video_url={video_id}&format=text&include_timestamp=false")
@@ -260,7 +270,9 @@ def fetch_transcript(video_id, max_retries=3, retry_delay=600):
 
         except urllib.error.HTTPError as e:
             if e.code == 403 and attempt < max_retries:
-                wait_min = retry_delay // 60
+                # Pick delay from backoff schedule (clamp to last value if overrun)
+                delay = backoff_schedule[min(attempt - 1, len(backoff_schedule) - 1)]
+                wait_min = delay // 60
                 log.warning(
                     f"Transcript 403 for {video_id} (video too new) — "
                     f"attempt {attempt}/{max_retries}, retrying in {wait_min} min")
@@ -268,9 +280,9 @@ def fetch_transcript(video_id, max_retries=3, retry_delay=600):
                     f"⏳ *RossWatcher* — transcript not ready yet for today's video\n"
                     f"YouTube is still processing captions. "
                     f"Retrying in {wait_min} min (attempt {attempt}/{max_retries})")
-                time.sleep(retry_delay)
+                time.sleep(delay)
             else:
-                log.error(f"Transcript fetch failed for {video_id}: {e}")
+                log.error(f"Transcript fetch failed for {video_id}: HTTP {e.code}")
                 return None
         except Exception as e:
             log.error(f"Transcript fetch failed for {video_id}: {e}")
@@ -278,6 +290,77 @@ def fetch_transcript(video_id, max_retries=3, retry_delay=600):
 
     log.error(f"Transcript fetch gave up after {max_retries} attempts for {video_id}")
     return None
+
+
+def _deferred_transcript_retry(video, date_str):
+    """
+    Background thread: waits DEFERRED_RETRY_DELAY then makes one final
+    transcript fetch attempt. If successful, runs the full analysis pipeline
+    and notifies via Telegram + Sheets.
+    """
+    vid_id = video["video_id"]
+    title  = video["title"]
+    link   = video["link"]
+    delay_min = DEFERRED_RETRY_DELAY // 60
+
+    log.info(f"Deferred retry scheduled for '{title}' in {delay_min} min")
+    time.sleep(DEFERRED_RETRY_DELAY)
+
+    log.info(f"Deferred retry firing for '{title}'")
+    tg_send(
+        f"🔄 *RossWatcher* — Deferred retry for _{title}_\n"
+        f"Attempting transcript fetch ({delay_min} min after last failure)...")
+
+    # Single attempt — no further retries from the deferred path
+    transcript = fetch_transcript(vid_id, max_retries=1)
+    if not transcript:
+        tg_send(
+            f"❌ *RossWatcher* — Deferred retry also failed for _{title}_\n"
+            f"Captions may not be available for this video. "
+            f"Try /rw check later or watch the video manually.\n"
+            f"🔗 {link}")
+        log.error(f"Deferred retry failed for {vid_id}")
+        return
+
+    # Success — run the full analysis pipeline
+    tg_send(f"✅ *RossWatcher* — Transcript now available! Analysing _{title}_...")
+
+    analysis = analyse_with_claude(transcript, title, date_str)
+    if not analysis:
+        tg_send(f"⚠️ RossWatcher: Claude analysis failed on deferred retry for _{title}_")
+        return
+
+    # Send to Telegram
+    now_et = datetime.now(ET_TZ)
+    header = (
+        f"📊 *Ross Cameron Recap Analysis* (deferred)\n"
+        f"_{title}_\n"
+        f"🔗 {link}\n"
+        f"{'─' * 35}\n\n"
+    )
+    tg_send(header + analysis)
+
+    # Push to Sheets
+    sheets_push({
+        "type":       "ross_insight",
+        "date":       now_et.strftime("%Y-%m-%d"),
+        "day_name":   now_et.strftime("%A"),
+        "video_id":   vid_id,
+        "video_title":title,
+        "video_url":  link,
+        "analysis":   analysis,
+        "transcript_length": len(transcript),
+        "deferred":   True,
+    })
+
+    # Mark as processed
+    state = load_state()
+    state["processed_ids"].append(vid_id)
+    state["processed_ids"] = state["processed_ids"][-60:]
+    state["last_check"] = now_et.isoformat()
+    save_state(state)
+
+    log.info(f"Deferred retry SUCCESS for '{title}'")
 
 # ── Claude analysis ───────────────────────────────────────────────────────────
 ANALYSIS_PROMPT = """You are analysing a Ross Cameron (Warrior Trading) daily trading recap video transcript.
@@ -333,7 +416,7 @@ def analyse_with_claude(transcript, video_title, date_str):
 
     try:
         payload = json.dumps({
-            "model":      "claude-3-5-sonnet-20241022",
+            "model":      "claude-sonnet-4-20250514",
             "max_tokens": 1500,
             "messages": [{"role": "user", "content": prompt}]
         }).encode()
@@ -425,7 +508,15 @@ def run_check(force=False):
         # 1. Fetch transcript
         transcript = fetch_transcript(vid_id)
         if not transcript:
-            tg_send(f"⚠️ RossWatcher: Could not fetch transcript for _{title}_")
+            deferred_min = DEFERRED_RETRY_DELAY // 60
+            tg_send(
+                f"⚠️ RossWatcher: Could not fetch transcript for _{title}_\n"
+                f"🔄 Scheduling deferred retry in {deferred_min} min...")
+            threading.Thread(
+                target=_deferred_transcript_retry,
+                args=(video, date_str),
+                daemon=True
+            ).start()
             continue
 
         # 2. Analyse with Claude
